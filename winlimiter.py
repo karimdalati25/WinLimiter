@@ -157,18 +157,111 @@ def parse_rate(text):
     raise ValueError("rate must look like 500kbit, 2mbit, 750kbps, 1mbps")
 
 
-def parse_rate(text):
-    """'500kbit' / '2mbit' / '750kbps' / '1mbps' -> bytes per second."""
-    t = text.strip().lower()
-    mult_bits = {"kbit": 1000, "mbit": 1_000_000, "gbit": 1_000_000_000}
-    mult_bytes = {"kbps": 1000, "mbps": 1_000_000, "gbps": 1_000_000_000}
-    for suf, m in mult_bits.items():
-        if t.endswith(suf):
-            return int(float(t[:-len(suf)]) * m / 8)
-    for suf, m in mult_bytes.items():
-        if t.endswith(suf):
-            return int(float(t[:-len(suf)]) * m)
-    raise ValueError("rate must look like 500kbit, 2mbit, 750kbps, 1mbps")
+# ----------------------------------------------------------------------------
+# MAC vendor (OUI) lookup - fallback when a host has no resolvable hostname.
+# Downloads the Wireshark 'manuf' vendor DB once, caches it, then works offline.
+# A small built-in table guarantees the common consumer brands even offline.
+# ----------------------------------------------------------------------------
+
+_OUI_SOURCES = [
+    "https://www.wireshark.org/download/automated/data/manuf",
+]
+
+_OUI_FALLBACK = {
+    "1C4586": "Nintendo", "9C305B": "Hon Hai/Sony", "0017AB": "Nintendo",
+    "0019FD": "Nintendo", "00051B": "Nintendo", "582F40": "Nintendo",
+    "DCA632": "Raspberry Pi", "B827EB": "Raspberry Pi", "E45F01": "Raspberry Pi",
+    "080027": "VirtualBox VM", "001C14": "VMware", "005056": "VMware",
+    "0027F8": "Microsoft/Xbox", "7CED8D": "Microsoft", "0017FA": "Microsoft",
+    "001DD8": "Microsoft", "C83F26": "Google", "F4F5D8": "Google",
+    "6466B3": "Google", "D8A3FF": "Apple", "F0D1A9": "Apple",
+    "A4B197": "Apple", "3C0754": "Apple", "AC87A3": "Apple", "F82793": "Apple",
+    "D0817A": "Apple", "040CCE": "Apple", "7CC2C6": "Samsung", "8CDDD2": "Samsung",
+    "86CDD2": "Samsung", "341513": "Samsung", "FC03D5": "Samsung",
+    "001377": "Samsung", "50F520": "Samsung", "0C8910": "Intel",
+    "A0D37A": "Intel", "001B21": "Intel", "AC7289": "Intel", "0024D7": "Intel",
+    "50C7BF": "TP-Link", "C006C3": "TP-Link", "001A11": "Google",
+    "FCFBFB": "Cisco", "00000C": "Cisco", "AC63BE": "Amazon", "0C47C9": "Amazon",
+    "44650D": "Amazon", "68DBF5": "Amazon", "DC56E7": "Espressif(IoT)",
+    "240AC4": "Espressif(IoT)", "A020A6": "Espressif(IoT)",
+}
+
+_oui_cache = None  # dict: 6-hex prefix -> vendor (lazy-loaded)
+
+
+def _oui_cache_path():
+    return os.path.join(tempfile.gettempdir(), "winlimiter_oui.txt")
+
+
+def _parse_manuf(text):
+    db = {}
+    hexset = set("0123456789ABCDEF")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t") if "\t" in line else line.split()
+        if len(parts) < 2:
+            continue
+        mac = parts[0].upper().replace("-", ":").split("/")[0]
+        octs = [o for o in mac.split(":") if o]
+        if len(octs) < 3:
+            continue
+        prefix = (octs[0] + octs[1] + octs[2])[:6]
+        if len(prefix) != 6 or any(c not in hexset for c in prefix):
+            continue
+        db.setdefault(prefix, parts[1].strip())
+    return db
+
+
+def _load_oui_db():
+    global _oui_cache
+    if _oui_cache is not None:
+        return _oui_cache
+    db = dict(_OUI_FALLBACK)
+    text = None
+    path = _oui_cache_path()
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 10000:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+    except Exception:
+        text = None
+    if text is None:
+        for url in _OUI_SOURCES:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "winlimiter"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    text = r.read().decode("utf-8", "ignore")
+                with open(path, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(text)
+                break
+            except Exception:
+                text = None
+    if text:
+        try:
+            db.update(_parse_manuf(text))
+        except Exception:
+            pass
+    _oui_cache = db
+    return db
+
+
+def vendor_for_mac(mac):
+    """Return a manufacturer name for a MAC, 'randomized-MAC' for a private
+    address, or '?' if unknown."""
+    if not mac:
+        return "?"
+    hexonly = mac.upper().replace(":", "").replace("-", "")
+    if len(hexonly) < 6:
+        return "?"
+    try:
+        # locally-administered bit (0x02 in first octet) => randomized/private
+        if int(hexonly[1], 16) & 0x2:
+            return "randomized-MAC"
+    except ValueError:
+        return "?"
+    return _load_oui_db().get(hexonly[:6], "?")
 
 
 class TokenBucket:
@@ -295,7 +388,11 @@ class WinLimiter:
             if ip in self.targets:
                 t = self.targets[ip]
                 st = "BLOCKED" if t["mode"] == "block" else f"LIMIT {t['rate_str']}"
-            name = (self.hostnames.get(ip) or "?")[:20]
+            name = self.hostnames.get(ip) or ""
+            if not name or name == "?":
+                v = vendor_for_mac(mac)
+                name = f"~{v}" if v and v != "?" else "?"
+            name = name[:20]
             print(f"   {idx:<3} {ip:<16} {mac:<19} {name:<21} {st}")
         print()
 
